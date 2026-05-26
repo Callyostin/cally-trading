@@ -1,6 +1,8 @@
+node_modules/
+.next/
 backend/venv/
 backend/__pycache__/
-frontend/node_modules/
-frontend/.next/
-*.db
+backend/trading.db
+backend/.env
 .env
+
