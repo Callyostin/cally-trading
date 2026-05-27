@@ -83,6 +83,24 @@ Uses **SQLite** with **SQLAlchemy** ORM for frictionless local deployment withou
 
 ## 🚀 How to Run the System
 
+You have three options for running the system: Docker (Recommended), the automated PowerShell script, or manual startup.
+
+*Note: For all methods, ensure your `backend/.env` file contains `OPENAI_API_KEY=your_key`.*
+
+### Option 1: Docker (Recommended)
+This is the easiest way to run the entire stack (Frontend, Backend, Postgres, Redis).
+```bash
+docker-compose up -d --build
+```
+The frontend will be available at `http://localhost:3000`.
+
+### Option 2: Automated PowerShell Script (Windows Local)
+This script will automatically set up the Python virtual environment, install node modules, and launch both the frontend and backend in separate windows.
+```powershell
+.\start_local.ps1
+```
+
+### Option 3: Manual Startup
 The application requires two separate processes running concurrently:
 
 1. **Start the Backend**
@@ -93,7 +111,6 @@ The application requires two separate processes running concurrently:
    pip install -r requirements.txt
    python main.py
    ```
-   *Note: Ensure your `.env` file contains `OPENAI_API_KEY=your_key`.*
 
 2. **Start the Frontend**
    ```bash
