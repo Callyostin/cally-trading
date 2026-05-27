@@ -1,4 +1,7 @@
-from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, Request, HTTPException, status
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
@@ -25,6 +28,14 @@ from pydantic import BaseModel
 
 # Global state for scenario forecasting
 LATEST_MARKET_STATE = {}
+
+# Global states for AI trigger
+LAST_AI_RESPONSE = None
+LAST_AI_TIME = 0
+PREV_REGIME = None
+PREV_VOLATILITY = None
+PREV_SUPPORT = 0
+PREV_RESISTANCE = float('inf')
 
 class BacktestRequest(BaseModel):
     symbol: str = "BTC/USDT"
@@ -57,6 +68,11 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Rate Limiter setup
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # CORS Setup
 app.add_middleware(
     CORSMiddleware,
@@ -79,11 +95,13 @@ async def websocket_endpoint(websocket: WebSocket):
         active_connections.remove(websocket)
 
 @app.post("/api/backtest")
-def trigger_backtest(req: BacktestRequest):
+@limiter.limit("10/minute")
+def trigger_backtest(request: Request, req: BacktestRequest):
     return run_backtest(symbol=req.symbol, timeframe=req.timeframe, limit=1000)
 
 @app.post("/api/journal/log")
-def log_trade(req: JournalEntry):
+@limiter.limit("50/minute")
+def log_trade(request: Request, req: JournalEntry):
     db = SessionLocal()
     try:
         new_entry = TradeJournal(
@@ -102,7 +120,8 @@ def log_trade(req: JournalEntry):
         db.close()
 
 @app.get("/api/journal/history")
-def get_journal_history():
+@limiter.limit("50/minute")
+def get_journal_history(request: Request):
     db = SessionLocal()
     try:
         trades = db.query(TradeJournal).order_by(TradeJournal.created_at.desc()).all()
@@ -111,7 +130,8 @@ def get_journal_history():
         db.close()
 
 @app.get("/api/journal/analyze")
-def analyze_behavior():
+@limiter.limit("10/minute")
+def analyze_behavior(request: Request):
     db = SessionLocal()
     try:
         trades = db.query(TradeJournal).order_by(TradeJournal.created_at.desc()).all()
@@ -122,7 +142,8 @@ def analyze_behavior():
         db.close()
 
 @app.post("/api/paper/execute")
-def execute_paper_trade(req: PaperExecuteRequest):
+@limiter.limit("30/minute")
+def execute_paper_trade(request: Request, req: PaperExecuteRequest):
     db = SessionLocal()
     try:
         portfolio = db.query(VirtualPortfolio).first()
@@ -153,7 +174,8 @@ def execute_paper_trade(req: PaperExecuteRequest):
         db.close()
 
 @app.get("/api/paper/portfolio")
-def get_paper_portfolio():
+@limiter.limit("100/minute")
+def get_paper_portfolio(request: Request):
     db = SessionLocal()
     try:
         portfolio = db.query(VirtualPortfolio).first()
@@ -175,7 +197,8 @@ def get_paper_portfolio():
         db.close()
 
 @app.post("/api/paper/reset")
-def reset_paper_account():
+@limiter.limit("5/minute")
+def reset_paper_account(request: Request):
     db = SessionLocal()
     try:
         db.query(ActivePosition).delete()
@@ -192,12 +215,14 @@ def reset_paper_account():
         db.close()
 
 @app.post("/api/scenario/analyze")
-def analyze_scenario(req: ScenarioRequest):
+@limiter.limit("5/minute")
+def analyze_scenario(request: Request, req: ScenarioRequest):
     global LATEST_MARKET_STATE
     result = scenario_agent.analyze_scenario(req.query, LATEST_MARKET_STATE)
     return {"success": True, "data": result}
 
 async def generate_and_broadcast_signals():
+    global LATEST_MARKET_STATE, LAST_AI_RESPONSE, LAST_AI_TIME, PREV_REGIME, PREV_VOLATILITY, PREV_SUPPORT, PREV_RESISTANCE
     while True:
         try:
             if not active_connections:
@@ -209,10 +234,6 @@ async def generate_and_broadcast_signals():
             # 1. Fetch Async MTF Data
             live_data = await fetch_mtf_data(symbol)
             
-            # 2. Call the AI Orchestrator
-            # 2.5 Fetch Dynamic News Headlines
-            headlines = fetch_crypto_headlines(symbol, live_data["volatility_state"])
-            
             # 2.8 Detect Market Regime
             regime_data = detect_market_regime(
                 rsi=live_data["indicators"]["rsi"],
@@ -220,8 +241,32 @@ async def generate_and_broadcast_signals():
                 mtf_trends=live_data["mtf_trends"]
             )
             
-            # 3. Analyze with NLP & AI Agent
-            ai_result = agent.analyze_market(symbol, live_data, headlines)
+            # Check AI Triggers
+            current_time = time.time()
+            trigger_ai = False
+            
+            if LAST_AI_RESPONSE is None:
+                trigger_ai = True
+            elif (current_time - LAST_AI_TIME) > 3600:
+                trigger_ai = True
+            elif regime_data["regime"] != PREV_REGIME:
+                trigger_ai = True
+            elif live_data["volatility_state"] in ["Expansion", "Extreme"] and PREV_VOLATILITY not in ["Expansion", "Extreme"]:
+                trigger_ai = True
+            elif live_data["last_price"] > PREV_RESISTANCE or live_data["last_price"] < PREV_SUPPORT:
+                trigger_ai = True
+
+            if trigger_ai:
+                headlines = fetch_crypto_headlines(symbol, live_data["volatility_state"])
+                ai_result = agent.analyze_market(symbol, live_data, headlines)
+                LAST_AI_RESPONSE = ai_result
+                LAST_AI_TIME = current_time
+                PREV_REGIME = regime_data["regime"]
+                PREV_VOLATILITY = live_data["volatility_state"]
+                PREV_SUPPORT = live_data["indicators"]["support"]
+                PREV_RESISTANCE = live_data["indicators"]["resistance"]
+            else:
+                ai_result = LAST_AI_RESPONSE.copy()
             
             # 3.2 Dynamic Risk Calculations
             risk_result = calculate_risk_metrics(symbol, live_data["last_price"], live_data["indicators"]["atr"], ai_result["signal"])
@@ -247,7 +292,6 @@ async def generate_and_broadcast_signals():
             ai_result["confidence"] = final_confidence
             
             # Update Global Market State for Scenario Agent
-            global LATEST_MARKET_STATE
             LATEST_MARKET_STATE = {
                 "volatility_state": live_data["volatility_state"],
                 "market_regime": regime_data["regime"],

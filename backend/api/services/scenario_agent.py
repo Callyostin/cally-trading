@@ -2,7 +2,9 @@ from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
+from api.services.ai_agent import TokenCallbackHandler
 import os
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,11 +15,20 @@ class ScenarioForecast(BaseModel):
     bearish_probability: float = Field(description="Percentage probability (0-100) of a bearish outcome in this scenario.")
     key_levels: list[str] = Field(description="A list of 2-3 key price levels or technical invalidation points to watch.")
 
+def sanitize_prompt(user_input: str) -> str:
+    dangerous_keywords = ["ignore", "override", "system prompt", "forget", "instructions", "bypass"]
+    sanitized = user_input.lower()
+    for word in dangerous_keywords:
+        sanitized = sanitized.replace(word, "[REDACTED]")
+    sanitized = re.sub(r'[^a-zA-Z0-9\s\.\?\,\$\-]', '', sanitized)
+    return sanitized
+
 class ScenarioAgent:
     def __init__(self):
         self.llm = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0.2, # Keep low for analytical consistency
+            max_tokens=500, # Strict boundary to prevent API abuse
             api_key=os.getenv("OPENAI_API_KEY")
         )
         self.parser = PydanticOutputParser(pydantic_object=ScenarioForecast)
@@ -51,13 +62,15 @@ Ensure your probabilities sum to 100%.
             last_price = live_state.get("last_price", 0.0)
             mtf_trends = live_state.get("mtf_trends", {})
 
+            safe_query = sanitize_prompt(query)
+
             result = self.chain.invoke({
                 "volatility_state": volatility_state,
                 "market_regime": market_regime,
                 "last_price": last_price,
                 "mtf_trends": mtf_trends,
-                "query": query
-            })
+                "query": safe_query
+            }, config={"callbacks": [TokenCallbackHandler("scenario_analysis")]})
             
             return {
                 "forecast": result.forecast,

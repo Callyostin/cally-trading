@@ -83,6 +83,11 @@ async def fetch_mtf_data(symbol: str = "BTC/USDT"):
     
     latest = primary_df.iloc[-1]
     
+    # Local Support and Resistance (Swing high/low over last 20 candles)
+    recent_20 = primary_df.iloc[-20:]
+    support = recent_20['low'].min()
+    resistance = recent_20['high'].max()
+    
     return {
         "symbol": symbol,
         "last_price": ticker['last'],
@@ -98,6 +103,44 @@ async def fetch_mtf_data(symbol: str = "BTC/USDT"):
             "bb_high": round(latest['bb_high'], 2) if not pd.isna(latest['bb_high']) else ticker['last'] * 1.05,
             "bb_low": round(latest['bb_low'], 2) if not pd.isna(latest['bb_low']) else ticker['last'] * 0.95,
             "bbw": round(latest_bbw, 2) if not pd.isna(latest_bbw) else 0,
-            "atr": round(latest['atr'], 2) if not pd.isna(latest['atr']) else 100
+            "atr": round(latest['atr'], 2) if not pd.isna(latest['atr']) else 100,
+            "support": round(support, 2),
+            "resistance": round(resistance, 2)
         }
     }
+
+def generate_market_summary(data: dict) -> str:
+    """
+    Converts raw market data into a highly compressed, structured summary to save tokens.
+    """
+    rsi = data['indicators']['rsi']
+    if rsi > 70:
+        rsi_state = "Overbought"
+    elif rsi < 30:
+        rsi_state = "Oversold"
+    else:
+        rsi_state = "Neutral"
+        
+    macd = data['indicators']['macd']
+    macd_signal = data['indicators']['macd_signal']
+    if macd > macd_signal and macd > 0:
+        macd_state = "Strong Bullish"
+    elif macd > macd_signal:
+        macd_state = "Bullish Crossover"
+    elif macd < macd_signal and macd < 0:
+        macd_state = "Strong Bearish"
+    else:
+        macd_state = "Bearish Crossover"
+        
+    trend_1h = data['mtf_trends'].get('1h', 'Neutral')
+    
+    summary = f"""{data['symbol']} Summary:
+- Trend: {trend_1h} (1H)
+- Price: {data['last_price']}
+- RSI: {rsi} ({rsi_state})
+- MACD: {macd_state}
+- Resistance: {data['indicators']['resistance']}
+- Support: {data['indicators']['support']}
+- Volatility: {data['volatility_state']}
+"""
+    return summary

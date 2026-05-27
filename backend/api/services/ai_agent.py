@@ -4,7 +4,19 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_core.callbacks import BaseCallbackHandler
 from typing import List
+from api.services.token_manager import compress_prompt, log_token_usage
+from api.services.market_data import generate_market_summary
+
+class TokenCallbackHandler(BaseCallbackHandler):
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
+    def on_llm_end(self, response, **kwargs):
+        if response.llm_output and "token_usage" in response.llm_output:
+            usage = response.llm_output["token_usage"]
+            log_token_usage(self.endpoint, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+
 
 class MarketAnalysisOutput(BaseModel):
     signal: str = Field(description="The trading signal, one of: BUY, SELL, HOLD")
@@ -20,27 +32,27 @@ class RealAIAgent:
     def __init__(self):
         self.api_key = os.getenv("OPENAI_API_KEY")
         if self.api_key:
-            self.llm = ChatOpenAI(temperature=0.2, model="gpt-4o-mini", api_key=self.api_key)
+            self.llm = ChatOpenAI(temperature=0.2, model="gpt-4o-mini", api_key=self.api_key, max_tokens=250)
             self.parser = JsonOutputParser(pydantic_object=MarketAnalysisOutput)
             self.prompt = PromptTemplate(
                 template="""You are a Senior AI Trading Systems Engineer and Quantitative Analyst.
-Analyze the following live market data, technical indicators, and recent news headlines for {symbol} and provide a highly structured, actionable trading signal.
+Analyze the following structured market summary and recent news headlines for {symbol} and provide a highly structured, actionable trading signal.
 
-Market Data & Technical Indicators:
-{market_data}
+Market Summary:
+{market_summary}
 
 Recent News Headlines:
 {news_headlines}
 
 Rules:
-1. Cross-reference the RSI, MACD, EMA (20 & 50), and Bollinger Bands to form your directional thesis.
+1. Cross-reference the indicators in the summary to form your directional thesis.
 2. Your reasons must be concise and actionable technical observations.
-3. Analyze the provided `volatility_state` and `bbw` to generate a `volatility_explanation` warning the user about potential squeeze/expansion dangers.
+3. Analyze the Volatility state to generate a `volatility_explanation` warning.
 4. Perform NLP sentiment analysis on the News Headlines to calculate a `fear_greed_score` (0-100), assign a `sentiment_label`, and generate a `news_summary`.
 
 {format_instructions}
 """,
-                input_variables=["symbol", "market_data", "news_headlines"],
+                input_variables=["symbol", "market_summary", "news_headlines"],
                 partial_variables={"format_instructions": self.parser.get_format_instructions()},
             )
             self.chain = self.prompt | self.llm | self.parser
@@ -54,11 +66,15 @@ Rules:
         """
         if self.llm:
             try:
+                market_summary = generate_market_summary(market_data)
+                news_str = json.dumps(news_headlines)
+                compressed_news = compress_prompt(news_str, max_tokens=500)
+
                 response = self.chain.invoke({
                     "symbol": symbol,
-                    "market_data": json.dumps(market_data, indent=2),
-                    "news_headlines": json.dumps(news_headlines, indent=2)
-                })
+                    "market_summary": market_summary,
+                    "news_headlines": compressed_news
+                }, config={"callbacks": [TokenCallbackHandler("analyze_market")]})
                 
                 if isinstance(response.get("reasons"), str):
                     response["reasons"] = [response["reasons"]]
