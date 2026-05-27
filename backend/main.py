@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 import asyncio
 import json
+import time
+from contextlib import asynccontextmanager
 
 # Load env vars
 load_dotenv()
@@ -62,10 +64,18 @@ class ScenarioRequest(BaseModel):
 # Create DB Tables
 Base.metadata.create_all(bind=engine)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(generate_and_broadcast_signals())
+    asyncio.create_task(track_signal_outcomes())
+    asyncio.create_task(run_paper_execution_loop())
+    yield
+
 app = FastAPI(
     title="AI Trading Assistant API",
     description="Backend services for the AI Trading Assistant Platform",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # Rate Limiter setup
@@ -353,12 +363,6 @@ async def generate_and_broadcast_signals():
             print(f"Background task error: {e}")
             
         await asyncio.sleep(20) # Poll slightly slower to respect rate limits with 6 timeframes
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(generate_and_broadcast_signals())
-    asyncio.create_task(track_signal_outcomes())
-    asyncio.create_task(run_paper_execution_loop())
 
 if __name__ == "__main__":
     import uvicorn
