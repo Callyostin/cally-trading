@@ -26,6 +26,9 @@ from api.services.learning_engine import get_historical_memory_multiplier, get_g
 from api.services.paper_engine import run_paper_execution_loop
 from api.services.regime_detector import detect_market_regime
 from api.services.scenario_agent import scenario_agent
+from api.engine.rules import evaluate_tactical_confluence
+from api.engine.decay import calculate_decay, get_expiration_time
+from datetime import datetime, timezone
 from pydantic import BaseModel
 
 # Global state for scenario forecasting
@@ -283,7 +286,6 @@ async def generate_and_broadcast_signals():
                 headlines = fetch_crypto_headlines(symbol, live_data["volatility_state"])
                 ai_result = agent.analyze_market(symbol, live_data, headlines)
                 
-                # Only cache the response and update time if it's a real AI response, not the fallback
                 if ai_result.get("market_condition") != "Signal generation temporarily unavailable":
                     LAST_AI_RESPONSE = ai_result
                     LAST_AI_TIME = current_time
@@ -293,14 +295,21 @@ async def generate_and_broadcast_signals():
                     PREV_RESISTANCE = live_data["indicators"]["resistance"]
             else:
                 ai_result = LAST_AI_RESPONSE.copy() if LAST_AI_RESPONSE else agent.analyze_market(symbol, live_data, [])
+
+            # Real-Time Tactical Engine
+            tactical_data = evaluate_tactical_confluence(ai_result.get("bias", "Neutral"), live_data["indicators"])
+            
+            # Combine AI Bias and Tactical Rule Engine
+            final_signal = tactical_data["tactical_signal"]
+            base_confidence = ai_result.get("bias_confidence", 0) + tactical_data["confluence_score"]
             
             # 3.2 Dynamic Risk Calculations
-            risk_result = calculate_risk_metrics(ai_result["signal"], live_data["last_price"], live_data["indicators"]["atr"], live_data["indicators"]["bb_high"], live_data["indicators"]["bb_low"])
+            risk_result = calculate_risk_metrics(final_signal, live_data["last_price"], live_data["indicators"]["atr"], live_data["indicators"]["bb_high"], live_data["indicators"]["bb_low"])
             
             # 3.5 Apply MTF, Volatility & Sentiment Weighting
             base_adj_confidence = apply_mtf_weighting(
-                signal=ai_result["signal"], 
-                base_confidence=ai_result["confidence"], 
+                signal=final_signal, 
+                base_confidence=base_confidence, 
                 mtf_trends=live_data["mtf_trends"],
                 volatility_state=live_data["volatility_state"],
                 fear_greed_score=ai_result.get("fear_greed_score", 50)
@@ -309,21 +318,53 @@ async def generate_and_broadcast_signals():
             # 3.8 Apply Adaptive Memory Reinforcement Loop
             db = SessionLocal()
             try:
-                memory_data = get_historical_memory_multiplier(db, ai_result["signal"], live_data["volatility_state"])
+                memory_data = get_historical_memory_multiplier(db, final_signal, live_data["volatility_state"])
                 global_perf = get_global_performance(db)
             finally:
                 db.close()
                 
-            final_confidence = min(99.0, round(base_adj_confidence * memory_data["multiplier"], 1))
-            ai_result["confidence"] = final_confidence
+            reinforced_confidence = base_adj_confidence * memory_data["multiplier"]
             
-            # Update Global Market State for Scenario Agent
-            LATEST_MARKET_STATE = {
-                "volatility_state": live_data["volatility_state"],
-                "market_regime": regime_data["regime"],
-                "last_price": live_data["last_price"],
-                "mtf_trends": live_data["mtf_trends"]
-            }
+            # Confidence Decay Calculation
+            generated_at = datetime.fromtimestamp(LAST_AI_TIME if LAST_AI_TIME > 0 else current_time, tz=timezone.utc)
+            decayed_confidence = calculate_decay(reinforced_confidence, generated_at, live_data["volatility_state"])
+            expiration = get_expiration_time(generated_at, live_data["volatility_state"])
+            
+            if decayed_confidence < 30.0 and final_signal != "HOLD":
+                final_signal = "HOLD"
+                tactical_data["reasons"].append("Signal Invalidated: Confidence decayed below threshold")
+            
+            # Emergency Volatility Interrupt
+            invalidated_by = None
+            if live_data["volatility_state"] == "Extreme":
+                invalidated_by = "Emergency Volatility"
+                final_signal = "HOLD"
+                tactical_data["reasons"].append("EMERGENCY INTERRUPT: Extreme volatility detected. Trades invalidated.")
+            
+            ai_result["confidence"] = decayed_confidence
+            ai_result["signal"] = final_signal
+            
+            # Fetch real Binance exposure and drawdown
+            account_exposure = 0.0
+            current_drawdown = 0.0
+            try:
+                balance = await binance_client.fetch_balance()
+                positions = await binance_client.fetch_positions()
+                if balance and positions:
+                    active_positions = [p for p in positions if float(p.get('contracts', 0) or p.get('positionAmt', 0)) != 0]
+                    total_equity = float(balance.get('total', {}).get('USDT', 0))
+                    
+                    if total_equity > 0:
+                        # Depending on margin type, ccxt returns notional or initialMargin
+                        total_position_value = sum(abs(float(p.get('notional', 0) or p.get('initialMargin', 0))) for p in active_positions)
+                        unrealized_pnl = sum(float(p.get('unrealizedProfit', 0)) for p in active_positions)
+                        
+                        account_exposure = round((total_position_value / total_equity) * 100, 2)
+                        
+                        if unrealized_pnl < 0:
+                            current_drawdown = round((unrealized_pnl / total_equity) * 100, 2)
+            except Exception as e:
+                print(f"Error fetching Binance risk data: {e}")
             
             # Combine payloads
             final_payload = {
@@ -334,7 +375,15 @@ async def generate_and_broadcast_signals():
                 "memory_reason": memory_data["reason"],
                 "global_performance": global_perf,
                 "market_regime": regime_data["regime"],
-                "regime_strategy": regime_data["strategy"]
+                "regime_strategy": regime_data["strategy"],
+                "reasons": ai_result.get("reasons", []) + tactical_data["reasons"],
+                "decay_rate": 0.5 if live_data["volatility_state"] == "Extreme" else 0.1,
+                "expiration_time": expiration.isoformat(),
+                "ai_bias_score": ai_result.get("bias_confidence", 0),
+                "local_confluence_score": tactical_data["confluence_score"],
+                "invalidated_by": invalidated_by,
+                "account_exposure": account_exposure,
+                "current_drawdown": current_drawdown
             }
             
             final_payload = validateTradeSetup(final_payload)
@@ -360,7 +409,12 @@ async def generate_and_broadcast_signals():
                     sentiment_label=final_payload.get("sentiment_label", "Neutral"),
                     news_summary=final_payload.get("news_summary", "No news available."),
                     market_regime=final_payload.get("market_regime", "Unknown"),
-                    regime_strategy=final_payload.get("regime_strategy", "Hold")
+                    regime_strategy=final_payload.get("regime_strategy", "Hold"),
+                    decay_rate=final_payload["decay_rate"],
+                    expiration_time=expiration,
+                    ai_bias_score=final_payload["ai_bias_score"],
+                    local_confluence_score=final_payload["local_confluence_score"],
+                    invalidated_by=final_payload["invalidated_by"]
                 )
                 db.add(signal_record)
                 db.commit()

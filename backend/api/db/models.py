@@ -34,6 +34,21 @@ class TradeSignal(Base):
     market_regime = Column(String)
     regime_strategy = Column(Text)
     
+    # New fields for Hybrid Real-Time Engine
+    decay_rate = Column(Float, default=0.1)
+    expiration_time = Column(DateTime(timezone=True))
+    ai_bias_score = Column(Float, default=0.0)
+    local_confluence_score = Column(Float, default=0.0)
+    invalidated_by = Column(String, default=None)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class AICache(Base):
+    __tablename__ = "ai_cache"
+
+    id = Column(Integer, primary_key=True, index=True)
+    state_hash = Column(String, index=True, unique=True)
+    response_json = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 class TradeJournal(Base):

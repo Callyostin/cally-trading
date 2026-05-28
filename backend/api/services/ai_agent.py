@@ -8,6 +8,9 @@ from langchain_core.callbacks import BaseCallbackHandler
 from typing import List
 from api.services.token_manager import compress_prompt, log_token_usage
 from api.services.market_data import generate_market_summary
+import hashlib
+from api.db.database import SessionLocal
+from api.db.models import AICache
 
 class TokenCallbackHandler(BaseCallbackHandler):
     def __init__(self, endpoint: str):
@@ -19,10 +22,10 @@ class TokenCallbackHandler(BaseCallbackHandler):
 
 
 class MarketAnalysisOutput(BaseModel):
-    signal: str = Field(description="The trading signal, one of: BUY, SELL, HOLD")
-    confidence: int = Field(description="Confidence level percentage between 0 and 100")
-    market_condition: str = Field(description="A short phrase describing the condition (e.g. 'Bearish continuation', 'Bullish breakout')")
-    reasons: List[str] = Field(description="A list of 3-5 bullet points explaining the technical reasons for the signal")
+    bias: str = Field(description="The macro directional bias, one of: Bullish, Bearish, Neutral")
+    bias_confidence: int = Field(description="Confidence level percentage in the macro bias between 0 and 100")
+    market_condition: str = Field(description="A short phrase describing the macro condition (e.g. 'Bearish continuation', 'Bullish breakout')")
+    reasons: List[str] = Field(description="A list of 3-5 bullet points explaining the strategic reasons for the bias")
     volatility_explanation: str = Field(description="A precise 1-sentence warning or observation about current volatility conditions based on BBW and ATR.")
     fear_greed_score: int = Field(description="A score from 0 (Extreme Fear) to 100 (Extreme Greed) based on NLP analysis of the provided news headlines.")
     sentiment_label: str = Field(description="One of: Extreme Fear, Fear, Neutral, Greed, Extreme Greed")
@@ -34,8 +37,9 @@ class RealAIAgent:
         if self.llm:
             self.parser = JsonOutputParser(pydantic_object=MarketAnalysisOutput)
             self.prompt = PromptTemplate(
-                template="""You are a Senior AI Trading Systems Engineer and Quantitative Analyst.
-Analyze the following structured market summary and recent news headlines for {symbol} and provide a highly structured, actionable trading signal.
+                template="""You are an Institutional AI Trading Strategist.
+Analyze the following highly compressed market summary and recent news headlines for {symbol}.
+Provide a MACRO DIRECTIONAL BIAS (Bullish, Bearish, Neutral) rather than an immediate execution signal.
 
 Market Summary:
 {market_summary}
@@ -44,8 +48,8 @@ Recent News Headlines:
 {news_headlines}
 
 Rules:
-1. Cross-reference the indicators in the summary to form your directional thesis.
-2. Your reasons must be concise and actionable technical observations.
+1. Cross-reference the indicators in the summary to form your strategic directional bias.
+2. Your reasons must be concise, focusing on macro context and overarching trend.
 3. Analyze the Volatility state to generate a `volatility_explanation` warning.
 4. Perform NLP sentiment analysis on the News Headlines to calculate a `fear_greed_score` (0-100), assign a `sentiment_label`, and generate a `news_summary`.
 
@@ -68,6 +72,19 @@ Rules:
                 market_summary = generate_market_summary(market_data)
                 news_str = json.dumps(news_headlines)
                 compressed_news = compress_prompt(news_str, max_tokens=500)
+                
+                # Check semantic cache
+                state_str = f"{symbol}_{market_summary}_{compressed_news}"
+                state_hash = hashlib.md5(state_str.encode('utf-8')).hexdigest()
+                
+                db = SessionLocal()
+                try:
+                    cached = db.query(AICache).filter(AICache.state_hash == state_hash).first()
+                    if cached:
+                        print(f"AI Cache hit for {symbol}")
+                        return {"symbol": symbol, **json.loads(cached.response_json)}
+                finally:
+                    db.close()
 
                 response = self.chain.invoke({
                     "symbol": symbol,
@@ -77,6 +94,18 @@ Rules:
                 
                 if isinstance(response.get("reasons"), str):
                     response["reasons"] = [response["reasons"]]
+                    
+                # Save to cache
+                db = SessionLocal()
+                try:
+                    new_cache = AICache(state_hash=state_hash, response_json=json.dumps(response))
+                    db.add(new_cache)
+                    db.commit()
+                except Exception as e:
+                    print(f"Cache save error: {e}")
+                    db.rollback()
+                finally:
+                    db.close()
                     
                 return {
                     "symbol": symbol,
@@ -89,7 +118,7 @@ Rules:
         # Fallback Logic (Failsafe)
         vol_state = market_data.get("volatility_state", "Normal")
         
-        signal = "HOLD"
+        bias = "Neutral"
         cond = "Signal generation temporarily unavailable"
         reasons = [
             "AI Analysis Service is currently unavailable", 
@@ -103,8 +132,8 @@ Rules:
 
         return {
             "symbol": symbol,
-            "signal": signal,
-            "confidence": 0,
+            "bias": bias,
+            "bias_confidence": 0,
             "market_condition": cond,
             "reasons": reasons,
             "volatility_explanation": vol_exp,
