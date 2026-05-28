@@ -18,7 +18,7 @@ from api.db.models import TradeSignal, TradeJournal, VirtualPortfolio, ActivePos
 from api.services.ai_agent import agent
 from api.services.behavioral_agent import behavioral_agent
 from api.services.market_data import fetch_mtf_data
-from api.services.risk_engine import calculate_risk_metrics, apply_mtf_weighting
+from api.services.risk_engine import calculate_risk_metrics, apply_mtf_weighting, validateTradeSetup
 from api.services.backtester import run_backtest
 from api.services.news_aggregator import fetch_crypto_headlines
 from api.services.outcome_tracker import track_signal_outcomes
@@ -64,12 +64,25 @@ class ScenarioRequest(BaseModel):
 # Create DB Tables
 Base.metadata.create_all(bind=engine)
 
+from api.services.binance_client import binance_client
+from api.services.task_manager import task_manager
+from api.services.market_data import start_background_pollers
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    asyncio.create_task(generate_and_broadcast_signals())
-    asyncio.create_task(track_signal_outcomes())
-    asyncio.create_task(run_paper_execution_loop())
+    # Start Binance polling loops
+    await start_background_pollers("BTC/USDT")
+    
+    # Start app tasks
+    await task_manager.start_task("broadcast_signals", generate_and_broadcast_signals())
+    await task_manager.start_task("track_outcomes", track_signal_outcomes())
+    await task_manager.start_task("paper_execution", run_paper_execution_loop())
+    
     yield
+    
+    # Graceful shutdown
+    await task_manager.cancel_all()
+    await binance_client.close()
 
 app = FastAPI(
     title="AI Trading Assistant API",
@@ -269,17 +282,20 @@ async def generate_and_broadcast_signals():
             if trigger_ai:
                 headlines = fetch_crypto_headlines(symbol, live_data["volatility_state"])
                 ai_result = agent.analyze_market(symbol, live_data, headlines)
-                LAST_AI_RESPONSE = ai_result
-                LAST_AI_TIME = current_time
-                PREV_REGIME = regime_data["regime"]
-                PREV_VOLATILITY = live_data["volatility_state"]
-                PREV_SUPPORT = live_data["indicators"]["support"]
-                PREV_RESISTANCE = live_data["indicators"]["resistance"]
+                
+                # Only cache the response and update time if it's a real AI response, not the fallback
+                if ai_result.get("market_condition") != "Signal generation temporarily unavailable":
+                    LAST_AI_RESPONSE = ai_result
+                    LAST_AI_TIME = current_time
+                    PREV_REGIME = regime_data["regime"]
+                    PREV_VOLATILITY = live_data["volatility_state"]
+                    PREV_SUPPORT = live_data["indicators"]["support"]
+                    PREV_RESISTANCE = live_data["indicators"]["resistance"]
             else:
-                ai_result = LAST_AI_RESPONSE.copy()
+                ai_result = LAST_AI_RESPONSE.copy() if LAST_AI_RESPONSE else agent.analyze_market(symbol, live_data, [])
             
             # 3.2 Dynamic Risk Calculations
-            risk_result = calculate_risk_metrics(symbol, live_data["last_price"], live_data["indicators"]["atr"], ai_result["signal"])
+            risk_result = calculate_risk_metrics(ai_result["signal"], live_data["last_price"], live_data["indicators"]["atr"], live_data["indicators"]["bb_high"], live_data["indicators"]["bb_low"])
             
             # 3.5 Apply MTF, Volatility & Sentiment Weighting
             base_adj_confidence = apply_mtf_weighting(
@@ -321,6 +337,8 @@ async def generate_and_broadcast_signals():
                 "regime_strategy": regime_data["strategy"]
             }
             
+            final_payload = validateTradeSetup(final_payload)
+            
             # 4. Save to DB
             db = SessionLocal()
             try:
@@ -335,14 +353,14 @@ async def generate_and_broadcast_signals():
                     take_profit=final_payload["take_profit"],
                     risk_reward_ratio=final_payload["risk_reward_ratio"],
                     risk_level=final_payload["risk_level"],
-                    mtf_trends=json.dumps(final_payload["mtf_trends"]),
-                    volatility_state=final_payload["volatility_state"],
-                    volatility_explanation=final_payload["volatility_explanation"],
-                    fear_greed_score=final_payload["fear_greed_score"],
-                    sentiment_label=final_payload["sentiment_label"],
-                    news_summary=final_payload["news_summary"],
-                    market_regime=final_payload["market_regime"],
-                    regime_strategy=final_payload["regime_strategy"]
+                    mtf_trends=json.dumps(final_payload.get("mtf_trends", {})),
+                    volatility_state=final_payload.get("volatility_state", "Normal"),
+                    volatility_explanation=final_payload.get("volatility_explanation", "Normal volatility."),
+                    fear_greed_score=final_payload.get("fear_greed_score", 50),
+                    sentiment_label=final_payload.get("sentiment_label", "Neutral"),
+                    news_summary=final_payload.get("news_summary", "No news available."),
+                    market_regime=final_payload.get("market_regime", "Unknown"),
+                    regime_strategy=final_payload.get("regime_strategy", "Hold")
                 )
                 db.add(signal_record)
                 db.commit()
@@ -362,7 +380,7 @@ async def generate_and_broadcast_signals():
         except Exception as e:
             print(f"Background task error: {e}")
             
-        await asyncio.sleep(20) # Poll slightly slower to respect rate limits with 6 timeframes
+        await asyncio.sleep(5) # Poll quickly since market_data is cached
 
 if __name__ == "__main__":
     import uvicorn

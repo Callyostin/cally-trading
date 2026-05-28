@@ -1,6 +1,6 @@
 import os
 import json
-from langchain_openai import ChatOpenAI
+from api.services.llm_factory import get_llm
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.pydantic_v1 import BaseModel, Field
@@ -14,9 +14,8 @@ class BehavioralAnalysisOutput(BaseModel):
 
 class BehavioralAgent:
     def __init__(self):
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        if self.api_key:
-            self.llm = ChatOpenAI(temperature=0.4, model="gpt-4o-mini", api_key=self.api_key)
+        self.llm = get_llm(temperature=0.4, model="gpt-4o-mini")
+        if self.llm:
             self.parser = JsonOutputParser(pydantic_object=BehavioralAnalysisOutput)
             self.prompt = PromptTemplate(
                 template="""You are a ruthless but elite Trading Psychologist and Quantitative Coach.

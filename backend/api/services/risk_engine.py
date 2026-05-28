@@ -1,10 +1,10 @@
 def calculate_risk_metrics(signal: str, last_price: float, atr: float, bb_high: float, bb_low: float):
     if signal == "HOLD" or signal == "NEUTRAL":
         return {
-            "entry_price": round(last_price, 2),
-            "stop_loss": round(last_price, 2),
-            "take_profit": round(last_price, 2),
-            "risk_reward_ratio": "0:0",
+            "entry_price": None,
+            "stop_loss": None,
+            "take_profit": None,
+            "risk_reward_ratio": None,
             "risk_level": "None"
         }
         
@@ -117,3 +117,52 @@ def apply_mtf_weighting(signal: str, base_confidence: float, mtf_trends: dict, v
         adjusted = adjusted * 0.8 # Penalize shorting bottom fear
         
     return min(99.0, round(adjusted, 1))
+
+def invalidate_setup(payload: dict, reason: str) -> dict:
+    payload["signal"] = "HOLD"
+    payload["entry_price"] = None
+    payload["stop_loss"] = None
+    payload["take_profit"] = None
+    payload["risk_reward_ratio"] = None
+    
+    if "reasons" in payload and isinstance(payload["reasons"], list):
+        # Add to insights instead of spamming reasons directly if we want
+        msg = f"Validation Failed: {reason}"
+        if msg not in payload["reasons"]:
+            payload["reasons"].append(msg)
+    return payload
+
+def validateTradeSetup(payload: dict) -> dict:
+    signal = payload.get("signal", "HOLD")
+    if signal in ["HOLD", "NEUTRAL"]:
+        return invalidate_setup(payload, "No valid trade setup (HOLD/NEUTRAL)")
+
+    entry = payload.get("entry_price")
+    sl = payload.get("stop_loss")
+    tp = payload.get("take_profit")
+
+    if entry is None or sl is None or tp is None:
+        return invalidate_setup(payload, "Missing execution targets")
+
+    if entry == sl or entry == tp or sl == tp:
+        return invalidate_setup(payload, "Duplicate execution targets")
+
+    risk = abs(entry - sl)
+    reward = abs(tp - entry)
+
+    if risk <= 0 or reward <= 0:
+        return invalidate_setup(payload, "Invalid risk/reward math")
+
+    try:
+        rr = round(reward / risk, 2)
+        payload["risk_reward_ratio"] = f"1:{rr}"
+    except ZeroDivisionError:
+        return invalidate_setup(payload, "Risk is zero")
+
+    if not payload.get("market_regime"):
+        return invalidate_setup(payload, "Market regime analysis incomplete")
+
+    if rr <= 0:
+        return invalidate_setup(payload, f"Poor risk-to-reward ratio (1:{rr})")
+
+    return payload

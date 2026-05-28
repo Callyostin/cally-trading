@@ -1,4 +1,4 @@
-from langchain_openai import ChatOpenAI
+from api.services.llm_factory import get_llm
 from langchain.prompts import PromptTemplate
 from langchain.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
@@ -25,11 +25,10 @@ def sanitize_prompt(user_input: str) -> str:
 
 class ScenarioAgent:
     def __init__(self):
-        self.llm = ChatOpenAI(
+        self.llm = get_llm(
             model="gpt-4o-mini",
             temperature=0.2, # Keep low for analytical consistency
-            max_tokens=500, # Strict boundary to prevent API abuse
-            api_key=os.getenv("OPENAI_API_KEY")
+            max_tokens=1500 # Strict boundary to prevent API abuse
         )
         self.parser = PydanticOutputParser(pydantic_object=ScenarioForecast)
         self.prompt = PromptTemplate(
@@ -52,7 +51,10 @@ Ensure your probabilities sum to 100%.
             input_variables=["volatility_state", "market_regime", "last_price", "mtf_trends", "query"],
             partial_variables={"format_instructions": self.parser.get_format_instructions()}
         )
-        self.chain = self.prompt | self.llm | self.parser
+        if self.llm:
+            self.chain = self.prompt | self.llm | self.parser
+        else:
+            self.chain = None
 
     def analyze_scenario(self, query: str, live_state: dict) -> dict:
         try:
@@ -63,6 +65,9 @@ Ensure your probabilities sum to 100%.
             mtf_trends = live_state.get("mtf_trends", {})
 
             safe_query = sanitize_prompt(query)
+
+            if not self.chain:
+                raise Exception("No AI API key provided in .env")
 
             result = self.chain.invoke({
                 "volatility_state": volatility_state,

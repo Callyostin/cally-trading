@@ -1,6 +1,6 @@
 import os
 import json
-from langchain_openai import ChatOpenAI
+from api.services.llm_factory import get_llm
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.pydantic_v1 import BaseModel, Field
@@ -30,9 +30,8 @@ class MarketAnalysisOutput(BaseModel):
 
 class RealAIAgent:
     def __init__(self):
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        if self.api_key:
-            self.llm = ChatOpenAI(temperature=0.2, model="gpt-4o-mini", api_key=self.api_key, max_tokens=250)
+        self.llm = get_llm(temperature=0.2, model="gpt-4o-mini", max_tokens=1500)
+        if self.llm:
             self.parser = JsonOutputParser(pydantic_object=MarketAnalysisOutput)
             self.prompt = PromptTemplate(
                 template="""You are a Senior AI Trading Systems Engineer and Quantitative Analyst.
@@ -87,40 +86,27 @@ Rules:
                 print(f"LLM Error: {e}")
                 pass
 
-        # Fallback Logic
-        rsi = market_data.get("indicators", {}).get("rsi", 50)
+        # Fallback Logic (Failsafe)
         vol_state = market_data.get("volatility_state", "Normal")
         
-        if rsi < 40:
-            signal = "BUY"
-            cond = "Oversold bounce potential"
-            reasons = ["RSI is below 40 indicating oversold conditions"]
-            fg_score = 25
-            fg_label = "Fear"
-            summary = "Market sentiment is deeply negative, presenting potential oversold bounce opportunities."
-        elif rsi > 60:
-            signal = "SELL"
-            cond = "Overbought retracement"
-            reasons = ["RSI is above 60 indicating overbought conditions"]
-            fg_score = 75
-            fg_label = "Greed"
-            summary = "Market is exhibiting greedy behavior, increasing the probability of a sharp retracement."
-        else:
-            signal = "HOLD"
-            cond = "Consolidating"
-            reasons = ["RSI is neutral"]
-            fg_score = 50
-            fg_label = "Neutral"
-            summary = "Market narrative is balanced with no clear directional bias from recent headlines."
+        signal = "HOLD"
+        cond = "Signal generation temporarily unavailable"
+        reasons = [
+            "AI Analysis Service is currently unavailable", 
+            "Awaiting system recovery to resume market tracking"
+        ]
+        fg_score = 50
+        fg_label = "Neutral"
+        summary = "No narrative available due to API service disruption."
             
         vol_exp = f"Current volatility state is {vol_state}."
 
         return {
             "symbol": symbol,
             "signal": signal,
-            "confidence": 75,
+            "confidence": 0,
             "market_condition": cond,
-            "reasons": reasons + ["(Generated via local fallback algorithm due to missing OpenAI API key)"],
+            "reasons": reasons,
             "volatility_explanation": vol_exp,
             "fear_greed_score": fg_score,
             "sentiment_label": fg_label,
